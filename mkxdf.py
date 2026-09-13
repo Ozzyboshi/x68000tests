@@ -52,21 +52,28 @@ CLUSTER_SIZE = SECTOR_SIZE * SECTORS_PER_CLUSTER
 MAX_CLUSTERS = TOTAL_SECTORS - DATA_START
 
 
-def build_boot_sector(oem=b"MKXDF1.0"):
-    """Boot sector with a Human68k BPB. Not bootable - data disk only."""
+def build_boot_sector(oem=b"X68MKXDF"):
+    """Boot sector with the BPB layout a real Human68k disk carries.
+
+    Despite the 68000, the BPB is the MS-DOS one: little-endian, starting at
+    offset 11. The first three bytes are a BRA.S plus a NOP, occupying the
+    same space as the x86 'EB xx 90' an MS-DOS disk would have. Not bootable -
+    this is a data disk.
+    """
     buf = bytearray(SECTOR_SIZE)
-    buf[0:2] = b"\x60\x1E"          # BRA.S to the stub at offset $20
-    buf[2:10] = oem.ljust(8)[:8]
-    # BPB at offset 10, big-endian
-    struct.pack_into(">H", buf, 10, SECTOR_SIZE)
-    buf[12] = SECTORS_PER_CLUSTER
-    buf[13] = NUM_FATS
-    struct.pack_into(">H", buf, 14, RESERVED_SECTORS)
-    struct.pack_into(">H", buf, 16, ROOT_ENTRIES)
-    struct.pack_into(">H", buf, 18, TOTAL_SECTORS)
-    buf[20] = MEDIA_BYTE
-    buf[21] = SECTORS_PER_FAT
-    buf[0x20:0x22] = b"\x4E\x75"    # rts - nothing to boot here
+    buf[0:3] = b"\x60\x3C\x90"      # BRA.S to the stub at $3E, then NOP
+    buf[3:11] = oem.ljust(8)[:8]
+    struct.pack_into("<H", buf, 11, SECTOR_SIZE)
+    buf[13] = SECTORS_PER_CLUSTER
+    struct.pack_into("<H", buf, 14, RESERVED_SECTORS)
+    buf[16] = NUM_FATS
+    struct.pack_into("<H", buf, 17, ROOT_ENTRIES)
+    struct.pack_into("<H", buf, 19, TOTAL_SECTORS)
+    buf[21] = MEDIA_BYTE
+    struct.pack_into("<H", buf, 22, SECTORS_PER_FAT)
+    struct.pack_into("<H", buf, 24, SECTORS_PER_TRACK)
+    struct.pack_into("<H", buf, 26, HEADS)
+    buf[0x3E:0x40] = b"\x4E\x75"    # rts - nothing to boot here
     return buf
 
 
@@ -182,16 +189,6 @@ def dump(path):
     print("  " + " ".join(f"{b:02x}" for b in img[16:32]))
 
     h = {
-        "bytes/sector":  struct.unpack_from(">H", img, 10)[0],
-        "sec/cluster":   img[12],
-        "num FATs":      img[13],
-        "reserved":      struct.unpack_from(">H", img, 14)[0],
-        "root entries":  struct.unpack_from(">H", img, 16)[0],
-        "total sectors": struct.unpack_from(">H", img, 18)[0],
-        "media":         f"0x{img[20]:02x}",
-        "sec/FAT":       img[21],
-    }
-    m = {
         "bytes/sector":  struct.unpack_from("<H", img, 11)[0],
         "sec/cluster":   img[13],
         "reserved":      struct.unpack_from("<H", img, 14)[0],
@@ -201,15 +198,26 @@ def dump(path):
         "media":         f"0x{img[21]:02x}",
         "sec/FAT":       struct.unpack_from("<H", img, 22)[0],
     }
-    print("\nread as Human68k BPB (offset 10, big-endian):")
+    m = {
+        "bytes/sector":  struct.unpack_from(">H", img, 10)[0],
+        "sec/cluster":   img[12],
+        "num FATs":      img[13],
+        "reserved":      struct.unpack_from(">H", img, 14)[0],
+        "root entries":  struct.unpack_from(">H", img, 16)[0],
+        "total sectors": struct.unpack_from(">H", img, 18)[0],
+        "media":         f"0x{img[20]:02x}",
+        "sec/FAT":       img[21],
+    }
+    print("\nBPB (MS-DOS layout at offset 11, little-endian - this is what a "
+          "real\nHuman68k disk carries):")
     for k, v in h.items():
         print(f"  {k:<14} {v}")
-    print("\nread as MS-DOS BPB (offset 11, little-endian):")
+    print("\nfor reference, the same bytes read big-endian from offset 10:")
     for k, v in m.items():
         print(f"  {k:<14} {v}")
 
     bpb = h if h["bytes/sector"] in (256, 512, 1024, 2048) else m
-    which = "Human68k" if bpb is h else "MS-DOS"
+    which = "real" if bpb is h else "alternative"
     if bpb["bytes/sector"] not in (256, 512, 1024, 2048):
         print("\nneither BPB looks sane - stopping here")
         return
@@ -234,17 +242,200 @@ def dump(path):
               f"BE: cluster {be_cl:>5} size {be_sz:>9}")
 
 
+def parse_bpb(img):
+    """Read the BPB of an existing disk.
+
+    Human68k floppies carry an MS-DOS style BPB: little-endian, offset 11.
+    Verified against a real HUMAN302 system disk, whose boot sector starts
+    with 60 3C 90 "X68IPL30" followed by 1024/1/1/2/192/1232/$FE/2.
+    """
+    if len(img) < 512:
+        return None
+    b = {
+        "bytes_per_sector":    struct.unpack_from("<H", img, 11)[0],
+        "sectors_per_cluster": img[13],
+        "reserved":            struct.unpack_from("<H", img, 14)[0],
+        "num_fats":            img[16],
+        "root_entries":        struct.unpack_from("<H", img, 17)[0],
+        "total_sectors":       struct.unpack_from("<H", img, 19)[0],
+        "media":               img[21],
+        "sectors_per_fat":     struct.unpack_from("<H", img, 22)[0],
+    }
+    if (b["bytes_per_sector"] not in (256, 512, 1024, 2048)
+            or b["sectors_per_cluster"] == 0
+            or b["num_fats"] not in (1, 2)
+            or b["reserved"] == 0
+            or b["sectors_per_fat"] == 0
+            or b["root_entries"] == 0):
+        return None
+    return b
+
+
+def layout(b):
+    """Derive where everything lives from the BPB."""
+    ss = b["bytes_per_sector"]
+    root_start = b["reserved"] + b["num_fats"] * b["sectors_per_fat"]
+    root_sectors = (b["root_entries"] * 32 + ss - 1) // ss
+    data_start = root_start + root_sectors
+    return {
+        "sector_size":   ss,
+        "cluster_size":  ss * b["sectors_per_cluster"],
+        "fat_offset":    b["reserved"] * ss,
+        "fat_bytes":     b["sectors_per_fat"] * ss,
+        "root_offset":   root_start * ss,
+        "root_bytes":    root_sectors * ss,
+        "data_start":    data_start,
+        "max_cluster":   1 + (b["total_sectors"] - data_start)
+                             // b["sectors_per_cluster"],
+    }
+
+
+def free_chain(fat, first):
+    """Release a cluster chain, returning how many clusters came back."""
+    n, c = 0, first
+    while 2 <= c < 0xFF0:
+        nxt = fat12_get(fat, c)
+        fat12_set(fat, c, 0)
+        n += 1
+        c = nxt
+    return n
+
+
+def inject(image_path, entries, out_path):
+    """Add files to an existing Human68k image, replacing same-named ones.
+
+    entries is a list of (dos_name, data) pairs.
+    """
+    img = bytearray(open(image_path, "rb").read())
+    b = parse_bpb(img)
+    if b is None:
+        sys.exit(f"error: {image_path} has no readable Human68k BPB - is it "
+                 f"really an X68000 disk? Try --dump on it.")
+    if b["total_sectors"] * b["bytes_per_sector"] > len(img):
+        sys.exit(f"error: {image_path} declares "
+                 f"{b['total_sectors']} sectors of {b['bytes_per_sector']} "
+                 f"bytes but the file is only {len(img)} bytes - truncated "
+                 f"image, or a .DIM that still has its 256 byte header?")
+    L = layout(b)
+
+    print(f"{image_path}: {b['bytes_per_sector']} bytes/sector, "
+          f"{b['sectors_per_cluster']} sector(s)/cluster, "
+          f"{b['num_fats']} FATs of {b['sectors_per_fat']}, "
+          f"{b['root_entries']} root entries, "
+          f"{b['total_sectors']} sectors")
+
+    fat = bytearray(img[L["fat_offset"]:L["fat_offset"] + L["fat_bytes"]])
+    root = bytearray(img[L["root_offset"]:L["root_offset"] + L["root_bytes"]])
+
+    # Show what is already there: on a real Human68k disk the sizes should
+    # look sensible. If they are absurd, the on-disk directory format is not
+    # what this tool assumes and nothing below can be trusted.
+    existing = []
+    for i in range(b["root_entries"]):
+        e = root[i * 32:(i + 1) * 32]
+        if e[0] == 0x00:
+            break
+        if e[0] == 0xE5 or e[11] & 0x08:          # deleted or volume label
+            continue
+        existing.append((e[0:8].decode("ascii", "replace").rstrip(),
+                         e[8:11].decode("ascii", "replace").rstrip(),
+                         struct.unpack_from("<I", e, 28)[0]))
+    if existing:
+        print("  already on the disk: " + ", ".join(
+            f"{n}.{x} ({s})" for n, x, s in existing[:6])
+            + (" ..." if len(existing) > 6 else ""))
+
+    for dos_name, data in entries:
+        base, ext = split_83(dos_name)
+
+        # Replace a file of the same name instead of duplicating it, so the
+        # disk can be rebuilt over and over without filling up.
+        slot = None
+        for i in range(b["root_entries"]):
+            e = root[i * 32:(i + 1) * 32]
+            if e[0] == 0x00:
+                if slot is None:
+                    slot = i
+                break
+            if e[0] == 0xE5:
+                if slot is None:
+                    slot = i
+                continue
+            if e[0:8] == base and e[8:11] == ext:
+                free_chain(fat, struct.unpack_from("<H", e, 26)[0])
+                slot = i
+                break
+        if slot is None:
+            sys.exit("error: root directory is full")
+
+        need = max(1, (len(data) + L["cluster_size"] - 1) // L["cluster_size"])
+        free = [c for c in range(2, L["max_cluster"] + 1)
+                if fat12_get(fat, c) == 0]
+        if len(free) < need:
+            sys.exit(f"error: {dos_name} needs {need} clusters, "
+                     f"only {len(free)} free")
+        chain = free[:need]
+
+        for n, c in enumerate(chain):
+            fat12_set(fat, c, 0xFFF if n == need - 1 else chain[n + 1])
+            off = (L["data_start"] + (c - 2) * b["sectors_per_cluster"]) \
+                * L["sector_size"]
+            chunk = data[n * L["cluster_size"]:(n + 1) * L["cluster_size"]]
+            img[off:off + len(chunk)] = chunk
+
+        e = bytearray(32)
+        e[0:8] = base
+        e[8:11] = ext
+        e[11] = 0x20
+        import time as _t
+        dos_time, dos_date = dos_datetime(_t.time())
+        struct.pack_into("<HHH", e, 22, dos_time, dos_date, chain[0])
+        struct.pack_into("<I", e, 28, len(data))
+        root[slot * 32:(slot + 1) * 32] = e
+
+        print(f"  + {dos_name:<14} {len(data):>7} bytes, "
+              f"{need} cluster(s) from {chain[0]}")
+
+    for i in range(b["num_fats"]):
+        off = L["fat_offset"] + i * L["fat_bytes"]
+        img[off:off + L["fat_bytes"]] = fat
+    img[L["root_offset"]:L["root_offset"] + L["root_bytes"]] = root
+
+    with open(out_path, "wb") as f:
+        f.write(img)
+    print(f"{out_path}: written")
+
+
 def main():
     p = argparse.ArgumentParser(description="Build a Human68k 2HD .XDF image")
     p.add_argument("files", nargs="*", help="files to place in the root")
     p.add_argument("-o", "--output", default="data.xdf")
     p.add_argument("-l", "--label", help="volume label (up to 11 chars)")
     p.add_argument("--dump", metavar="IMAGE", help="inspect an image instead")
+    p.add_argument("--inject", metavar="IMAGE",
+                   help="add the files to an existing Human68k image (your "
+                        "system disk) instead of building one from scratch; "
+                        "the source image is not modified, -o gets the copy")
+    p.add_argument("--autoexec", metavar="COMMAND",
+                   help="also add an AUTOEXEC.BAT running COMMAND, so the "
+                        "disk starts it by itself at boot")
     a = p.parse_args()
 
     if a.dump:
         dump(a.dump)
         return
+
+    if a.inject:
+        entries = [(f.rsplit("/", 1)[-1], open(f, "rb").read())
+                   for f in a.files]
+        if a.autoexec:
+            entries.append(("AUTOEXEC.BAT",
+                            f"ECHO OFF\r\n{a.autoexec}\r\n".encode("ascii")))
+        if not entries:
+            p.error("nothing to inject")
+        inject(a.inject, entries, a.output)
+        return
+
     if not a.files:
         p.error("no input files")
     build_image(a.files, a.output, a.label)
